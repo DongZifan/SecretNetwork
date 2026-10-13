@@ -1,121 +1,167 @@
-const Express = require('express');
-const BodyParser = require('body-parser');
-const Crypto = require('crypto');
-const ExecFile = require('child_process').execFile;
-const Fs = require('fs');
-const Path = require('path');
+const http = require("http");
+const querystring = require("querystring");
+const execFile = require("child_process").execFile;
 
-const co = require('co');
+const FAUCET_WALLET_NAME = process.env.FAUCET_WALLET_NAME || "a";
+const FAUCET_AMOUNT = process.env.FAUCET_AMOUNT || "1000000000";
+const DENOM = process.env.DENOM || "uscrt";
 
-// Get environment variables.
-const envTMP = process.env.TMP || '/tmp/qmk-';
-const envPORT = process.env.PORT || 80;
-const envQMK = process.env.QMK || null;
-const envSTATIC = process.env.STATIC || null;
-if (envQMK === null) {
-  console.error('No QMK environment variable specified');
-  process.exit(1);
+let faucet_address;
+
+/**
+ * Execute a program directly (no shell) and return its JSON output as a Promise.
+ * Arguments are passed as an array so user-controlled values are never
+ * interpreted by a shell.
+ * @param cmd {string} program to run
+ * @param args {string[]} arguments to pass to the program
+ * @return {Promise<string>}
+ */
+function execShellCommand(cmd, args = []) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, (error, stdout, stderr) => {
+      if (error) {
+        console.error("error in execShellCommand", error);
+        reject(error);
+      } else if (stderr) {
+        console.error("stderr in execShellCommand", stderr);
+        reject(stderr);
+      } else {
+        resolve(JSON.parse(stdout));
+      }
+    });
+  });
 }
-if (envSTATIC === null) {
-  console.error('No STATIC environment variable specified');
-  process.exit(1);
+
+/**
+ * Command to send coins.
+ * @param src_key_name source account key name, default 'a'
+ * @param src_address  source account's secret address
+ * @param dest_address destination address
+ * @param amount amount to send
+ * @returns result of executing the command.
+ */
+async function send_command(src_key_name, src_address, dest_address, amount) {
+  // Build the argument list explicitly. `dest_address` is passed as a single,
+  // literal argument, so it cannot be interpreted as shell syntax.
+  const send_args = [
+    "tx", "bank", "send",
+    src_address,
+    dest_address,
+    `${amount}${DENOM}`,
+    "--from", src_key_name,
+    "--gas-prices", "0.25uscrt",
+    "-y",
+  ];
+  console.log(`send_message: \n secretd ${send_args.join(" ")}`);
+
+  const result = await execShellCommand("secretd", send_args);
+  console.log(`Sent tokens with txhash: ${result.txhash}`);
+  return result.txhash;
 }
 
-// Create the express app.
-const app = Express();
-app.use(BodyParser.json());
-app.use(BodyParser.urlencoded({ extended: true }));
+/**
+ * Returns the address for the requested account key.
+ * @param key_name faucet account key to use, default 'a'
+ * @returns address
+ */
+async function get_address(key_name) {
+  // Already looked up, won't change while running
+  if (faucet_address !== undefined) {
+    return faucet_address;
+  }
 
-// Allow cross-origin requests.
-app.all('*', (req, res, next) => {
-	res.header('Access-Control-Allow-Origin', '*');
-	res.header('Access-Control-Allow-Headers', 'X-Requested-With');
-	res.header('Access-Control-Allow-Headers', 'Content-Type');
-	next();
+  const result = await execShellCommand("secretd", ["keys", "list"]);
+
+  for (index in result) {
+    const key = result[index];
+    if (key["name"] == key_name) {
+      console.log(`Found key with address: ${key["address"]}`);
+      faucet_address = key["address"];
+      break;
+    }
+  }
+
+  return faucet_address;
+}
+
+// Start the http server
+const server = http.createServer();
+server.on("request", async (req, res) => {
+  try {
+    // for root or status, return the configured faucet address and amount sent
+    if (req.url === "/" || req.url === "/status") {
+      const faucet_address = await get_address(FAUCET_WALLET_NAME);
+
+      if (faucet_address === undefined) {
+        console.error(
+          `No key account with required name: ${FAUCET_WALLET_NAME}`
+        );
+
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.write(
+          JSON.stringify({
+            error: `No key account with required name: ${FAUCET_WALLET_NAME}`,
+          })
+        );
+        res.end();
+        return;
+      } else {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.write(
+          JSON.stringify({
+            faucet_address: faucet_address,
+            amount: FAUCET_AMOUNT,
+          })
+        );
+        res.end();
+      }
+    } else if (req.url.startsWith("/faucet")) {
+      // ensure address is present, not necessarily valid checksum
+      if (!req.url.startsWith("/faucet?address=")) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.write(JSON.stringify({ error: "address is required" }));
+        res.end();
+        return;
+      }
+
+      const address = querystring.parse(req.url)["/faucet?address"];
+      const faucet_address = await get_address(FAUCET_WALLET_NAME);
+
+      if (faucet_address === undefined) {
+        console.error(
+          `No key account with required name: ${FAUCET_WALLET_NAME}`
+        );
+
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.write(
+          JSON.stringify({
+            error: `No key account with required name: ${FAUCET_WALLET_NAME}`,
+          })
+        );
+        res.end();
+        return;
+      } else {
+        const txhash = await send_command(
+          FAUCET_WALLET_NAME,
+          faucet_address,
+          address,
+          FAUCET_AMOUNT
+        );
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.write(JSON.stringify({ txhash: txhash }));
+        res.end();
+      }
+    } else {
+      res.end("Invalid Request!");
+    }
+  } catch (err) {
+    res.writeHead(500, { "Content-Type": "application/json" });
+    res.write(JSON.stringify({ error: `${err.message}` }));
+    res.end();
+  }
 });
 
-// Serve static content.
-app.use(Express.static(envSTATIC));
+server.listen(5000);
 
-// Set up the /build route.
-app.post('/build', (req, res) => {
-	// Get the files.
-	const files = req.body;
-
-	// Create a temporary directory.
-	const key = Crypto.randomBytes(16).toString('hex');
-  const tmpdir = envTMP + key;
-
-	// Setup helper functions.
-	// Use execFile so that arguments are passed directly to the program and are
-	// never interpreted by a shell (no command injection through QMK/TMP values).
-	const clean = () => {
-		ExecFile('rm', ['-rf', tmpdir]);
-	};
-
-	const sendError = err => {
-    console.error(err);
-		res.json({ error: err });
-		clean();
-	};
-
-	// Start.
-	co(function*() {
-
-		// Copy the base stencil.
-		yield new Promise((resolve, reject) => {
-			ExecFile('cp', ['-rp', envQMK, tmpdir], (err, stdout, stderr) => {
-				if (err) return reject('Failed to initialize.');
-				resolve();
-			});
-		});
-
-		// Copy all the files.
-		for (const file in files) {
-			yield new Promise((resolve, reject) => {
-				const fileName = Path.resolve(file.replace('qmk_firmware', tmpdir));
-				const safeRoot = Path.resolve(tmpdir) + Path.sep;
-				if (fileName.indexOf(safeRoot) !== 0) {
-					return reject('Failed to initialize.');
-				}
-				Fs.writeFile(fileName, files[file], err => {
-					if (err) return reject('Failed to initialize.');
-					resolve();
-				});
-			});
-		}
-
-		// Make.
-		yield new Promise((resolve, reject) => {
-			ExecFile('make', [], { cwd: tmpdir + '/keyboards/kb' }, (err, stdout, stderr) => {
-				if (err) return reject(stderr);
-				resolve();
-			});
-		});
-
-		// Read the hex file.
-		const hex = yield new Promise((resolve, reject) => {
-			Fs.readFile(tmpdir + '/kb_default.hex', 'utf8', (err, data) => {
-				if (err) return reject('Failed to read hex file.');
-				resolve(data);
-			});
-		});
-
-		// Send the hex file.
-		res.json({ hex: hex });
-
-		// Clean up.
-		clean();
-	}).catch(e => sendError(e));
-});
-
-// Start listening.
-app.listen(envPORT, () => console.log('Listening on port ' + envPORT + '...'));
-
-// Exit on SIGINT and SIGTERM.
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
-function shutdown() {
-  // TODO: This is not a clean shutdown.
-  process.exit(0);
-}
+console.log("Secret Faucet is running on port 5000 ...");
